@@ -7,13 +7,14 @@
 // copies with buildDossier, and writes it to <out>/dossier.json.
 
 import { cpSync, existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from 'node:fs';
-import { extname, join } from 'node:path';
+import { dirname, extname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { buildDossier } from './vendor/makefun-game.ts';
 
-/** Where the packaged entry goes: MAKEFUN_OUTPUT_DIR, or ./out by default. */
-const OUT_DIR = process.env.MAKEFUN_OUTPUT_DIR || 'out';
-/** The repository root this program runs from. */
-const ROOT = process.cwd();
+/** Where the packaged entry goes: MAKEFUN_OUTPUT_DIR, or /output by default. */
+const OUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+/** The repository root: the folder this program file sits in, independent of the caller's working directory. */
+const ROOT = dirname(fileURLToPath(import.meta.url));
 
 /** Preflight caps, mirroring the bounty's gate. */
 const MAX_SCREENSHOT_BYTES = 256 * 1024; // 256 KiB per screenshot
