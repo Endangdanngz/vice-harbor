@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Vice Harbor — Make GTA 6</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="src/ui.css">
+<script type="importmap">
+{ "imports": { "three": "./vendor/three.module.min.js" } }
+</script>
+</head>
+<body>
+<div id="game-container"></div>
+
+<div id="hud" class="hidden">
+  <div id="hud-top-left">
+    <div id="cash">$0</div>
+    <div id="health-wrap"><div id="health-bar"></div><span id="health-text">100</span></div>
+  </div>
+  <div id="hud-top-right">
+    <div id="stars"></div>
+    <canvas id="minimap" width="180" height="180"></canvas>
+  </div>
+  <div id="objective"><span id="objective-label">OBJECTIVE</span><span id="objective-text"></span></div>
+  <div id="hud-bottom-left">
+    <div id="weapon">PISTOL</div>
+    <div id="speed">0 mph</div>
+    <div id="hint">E — enter / exit car &nbsp;·&nbsp; F — shoot &nbsp;·&nbsp; Shift — sprint</div>
+  </div>
+  <div id="toast"></div>
+  <div id="crosshair">+</div>
+  <div id="timer" class="hidden">00:00</div>
+</div>
+
+<div id="start-screen">
+  <h1 class="title">VICE <span>HARBOR</span></h1>
+  <p class="subtitle">An open-world crime story in one neon district</p>
+  <div class="controls">
+    <p><b>W A S D</b> — move / drive &nbsp;·&nbsp; <b>Mouse</b> — look</p>
+    <p><b>E</b> — steal / enter car, exit car &nbsp;·&nbsp; <b>Click</b> — shoot pistol</p>
+    <p><b>Shift</b> — sprint &nbsp;·&nbsp; <b>Space</b> — brake / handbrake &nbsp;·&nbsp; <b>P</b> — pause</p>
+  </div>
+  <button id="start-btn">START ENGINE</button>
+  <p class="save-note" id="save-note"></p>
+  <p class="credit">Steal cars. Dodge the law. Run the harbor.</p>
+</div>
+
+<div id="pause-screen" class="hidden">
+  <h2>PAUSED</h2>
+  <p>Press P or click Resume to keep playing.</p>
+  <button id="resume-btn">RESUME</button>
+</div>
+
+<div id="gameover-screen" class="hidden">
+  <h2>BUSTED / WASTED</h2>
+  <p id="gameover-text"></p>
+  <button id="respawn-btn">RESPAWN AT HOSPITAL — $100</button>
+</div>
+
+<script type="module" src="src/main.js"></script>
+</body>
+</html>
