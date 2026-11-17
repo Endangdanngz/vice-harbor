@@ -1,60 +1,94 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="utf-8">
-<title>Vice Harbor — Make GTA 6</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Vice Harbor</title>
 <link rel="stylesheet" href="src/ui.css">
-<script type="importmap">
-{ "imports": { "three": "./vendor/three.module.min.js" } }
-</script>
 </head>
 <body>
-<div id="game-container"></div>
+<div id="app"></div>
 
 <div id="hud" class="hidden">
-  <div id="hud-top-left">
+  <div id="objective">
+    <div id="objective-title">FREE ROAM</div>
+    <div id="objective-text">Explore Vice Harbor.</div>
+  </div>
+
+  <div id="weather-chip">--:-- · Clear · Day</div>
+
+  <div id="stats">
     <div id="cash">$0</div>
-    <div id="health-wrap"><div id="health-bar"></div><span id="health-text">100</span></div>
+    <div id="stars" class="stars-0">☆☆☆☆☆</div>
+    <div class="bar-row"><span class="bar-label">HP</span>
+      <div class="bar"><div id="health-fill" class="fill health"></div></div>
+    </div>
+    <div class="bar-row"><span class="bar-label">AR</span>
+      <div class="bar"><div id="armor-fill" class="fill armor"></div></div>
+    </div>
+    <div class="bar-row"><span class="bar-label">ST</span>
+      <div class="bar"><div id="stamina-fill" class="fill stamina"></div></div>
+    </div>
   </div>
-  <div id="hud-top-right">
-    <div id="stars"></div>
-    <canvas id="minimap" width="180" height="180"></canvas>
-  </div>
-  <div id="objective"><span id="objective-label">OBJECTIVE</span><span id="objective-text"></span></div>
-  <div id="hud-bottom-left">
-    <div id="weapon">PISTOL</div>
-    <div id="speed">0 mph</div>
-    <div id="hint">E — enter / exit car &nbsp;·&nbsp; F — shoot &nbsp;·&nbsp; Shift — sprint</div>
-  </div>
+
+  <canvas id="minimap" width="190" height="190"></canvas>
+  <div id="crosshair"><span class="ring"></span><span class="dot"></span></div>
+  <div id="prompt"></div>
   <div id="toast"></div>
-  <div id="crosshair">+</div>
-  <div id="timer" class="hidden">00:00</div>
 </div>
 
-<div id="start-screen">
-  <h1 class="title">VICE <span>HARBOR</span></h1>
-  <p class="subtitle">An open-world crime story in one neon district</p>
-  <div class="controls">
-    <p><b>W A S D</b> — move / drive &nbsp;·&nbsp; <b>Mouse</b> — look</p>
-    <p><b>E</b> — steal / enter car, exit car &nbsp;·&nbsp; <b>Click</b> — shoot pistol</p>
-    <p><b>Shift</b> — sprint &nbsp;·&nbsp; <b>Space</b> — brake / handbrake &nbsp;·&nbsp; <b>P</b> — pause</p>
+<div id="start-screen" class="screen">
+  <div class="panel">
+    <h1 class="logo">VICE <span>HARBOR</span></h1>
+    <p class="tagline">One city. One wheelman. Every cop on the payroll of somebody else.</p>
+    <div class="controls-grid">
+      <div><b>W A S D</b><span>Move / drive</span></div>
+      <div><b>Mouse</b><span>Look (click Start to lock)</span></div>
+      <div><b>Click</b><span>Shoot</span></div>
+      <div><b>E</b><span>Enter / exit vehicle</span></div>
+      <div><b>Shift</b><span>Sprint</span></div>
+      <div><b>Space</b><span>Brake / handbrake</span></div>
+      <div><b>P</b><span>Pause</span></div>
+      <div><b>Missions</b><span>Follow the pink marker</span></div>
+    </div>
+    <button id="btn-start" class="btn neon">START ENGINE</button>
+    <p class="note">Click Start — mouse locks for look. Esc opens pause.</p>
   </div>
-  <button id="start-btn">START ENGINE</button>
-  <p class="save-note" id="save-note"></p>
-  <p class="credit">Steal cars. Dodge the law. Run the harbor.</p>
 </div>
 
-<div id="pause-screen" class="hidden">
-  <h2>PAUSED</h2>
-  <p>Press P or click Resume to keep playing.</p>
-  <button id="resume-btn">RESUME</button>
+<div id="pause-screen" class="screen hidden">
+  <div class="panel small">
+    <h2 class="screen-title">PAUSED</h2>
+    <button id="btn-resume" class="btn neon">RESUME</button>
+    <button id="btn-settings" class="btn ghost">SETTINGS</button>
+    <button id="btn-restart" class="btn ghost">RESTART RUN</button>
+  </div>
 </div>
 
-<div id="gameover-screen" class="hidden">
-  <h2>BUSTED / WASTED</h2>
-  <p id="gameover-text"></p>
-  <button id="respawn-btn">RESPAWN AT HOSPITAL — $100</button>
+<div id="settings-panel" class="screen hidden">
+  <div class="panel small">
+    <h2 class="screen-title">SETTINGS</h2>
+    <label class="set-row"><span>Volume</span>
+      <input id="set-volume" type="range" min="0" max="100" value="80"></label>
+    <label class="set-row"><span>Mouse sensitivity</span>
+      <input id="set-sensitivity" type="range" min="50" max="200" value="100"></label>
+    <label class="set-row"><span>Quality</span>
+      <select id="set-quality">
+        <option value="high">High</option>
+        <option value="low">Low</option>
+      </select></label>
+    <label class="set-row check"><span>Invert Y</span>
+      <input id="set-invert" type="checkbox"></label>
+    <button id="btn-settings-close" class="btn neon">DONE</button>
+  </div>
+</div>
+
+<div id="death-screen" class="screen hidden">
+  <div class="panel small">
+    <h2 class="wasted">WASTED</h2>
+    <p id="death-fee" class="tagline">Hospital bill: $0</p>
+    <button id="btn-respawn" class="btn neon">RESPAWN</button>
+  </div>
 </div>
 
 <script type="module" src="src/main.js"></script>

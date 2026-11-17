@@ -1,297 +1,623 @@
-// missions.js — 3-mission story chain + free-roam cash pickups.
-import * as THREE from 'three';
-import { spawnCar } from './vehicles.js';
+// missions.js — Vice Harbor story mission engine.
+//
+// Five hand-written jobs chained into a small campaign: steal a convertible,
+// run a hot package down the beach, beat the clock on a night delivery, lift
+// three cash crates under rising heat, and finish with the big one — a
+// connected owner's magenta supercar that has to cross the whole map.
+//
+// The engine is step based. Each mission is a list of steps (goto / steal /
+// deliver / pickup / escape) built fresh every time the mission starts, so a
+// failed or restarted job always respawns its cars and props cleanly. A tall
+// glowing beacon and a floating ring mark the current target in the world;
+// the same coordinates are exposed as `marker` for the minimap.
 
-const MISSION_DEFS = [
-  {
-    id: 1, name: 'Hot Wheels',
-    steps: [
-      { text: 'Steal the marked car (gold ring)', target: 'markedCar', radius: 4 },
-      { text: 'Deliver the car to the gold marker', target: 'deliver', radius: 6 },
-    ],
-    reward: 500,
-  },
-  {
-    id: 2, name: 'The Package',
-    steps: [
-      { text: 'Pick up the package at the gold marker', target: 'package', radius: 4 },
-      { text: 'Lose the heat — deliver the package downtown', target: 'dropoff', radius: 6 },
-    ],
-    reward: 800,
-  },
-  {
-    id: 3, name: 'Beach Getaway',
-    steps: [
-      { text: 'Reach the beach before time runs out!', target: 'beach', radius: 10, timed: 90 },
-    ],
-    reward: 1200,
-  },
-];
+import * as THREE from '../vendor/three.module.min.js';
+import { makeCar } from './vehicles.js';
 
-function makeBeacon(color) {
-  const geo = new THREE.CylinderGeometry(1.6, 1.6, 60, 16, 1, true);
-  const mat = new THREE.MeshBasicMaterial({
-    color, transparent: true, opacity: 0.28, side: THREE.DoubleSide,
-    blending: THREE.AdditiveBlending, depthWrite: false,
-  });
-  const beacon = new THREE.Mesh(geo, mat);
-  beacon.position.y = 30;
-  const ring = new THREE.Mesh(
-    new THREE.TorusGeometry(2.4, 0.14, 8, 32),
-    new THREE.MeshBasicMaterial({ color })
-  );
-  ring.rotation.x = Math.PI / 2;
-  ring.position.y = 0.25;
-  beacon.add(ring);
-  return beacon;
-}
+const FREE_ROAM = {
+  title: 'Free Roam',
+  objective: 'All missions complete — the harbor is yours.',
+};
 
-function makePickupMesh() {
-  const g = new THREE.Group();
-  const box = new THREE.Mesh(
-    new THREE.BoxGeometry(0.7, 0.7, 0.7),
-    new THREE.MeshStandardMaterial({ color: 0x2eff7a, emissive: 0x2eff7a, emissiveIntensity: 0.9 })
-  );
-  g.add(box);
-  const sign = new THREE.Mesh(
-    new THREE.BoxGeometry(0.76, 0.2, 0.76),
-    new THREE.MeshBasicMaterial({ color: 0xd8ffd8 })
-  );
-  g.add(sign);
-  return g;
-}
+// Beacon / prop palette.
+const BEACON_COLOR = 0xffd94d;
+const PACKAGE_COLOR = 0xffc21c;
+const CRATE_COLOR = 0x2eff7a;
 
-export function createMissions(G) {
-  const M = {
-    defs: MISSION_DEFS,
-    index: G.missionIndex || 0,
-    step: 0,
-    timer: 0,
+export function createMissions(ctx) {
+  const scene = ctx.scene;
+  const player = ctx.player;
+  const wanted = ctx.wanted;
+
+  // Mission table. `build` functions are declared (and hoisted) below; each
+  // one spawns that job's cars and returns its step list.
+  const MISSIONS = [
+    { title: 'First Wheels', reward: 300, timeLimit: 0, build: buildFirstWheels },
+    { title: 'Beach Run', reward: 450, timeLimit: 0, build: buildBeachRun },
+    { title: 'Night Courier', reward: 600, timeLimit: 150, build: buildNightCourier },
+    { title: 'Harbor Heat', reward: 800, timeLimit: 0, build: buildHarborHeat },
+    { title: 'The Vice Harbor Job', reward: 1500, timeLimit: 0, build: buildViceHarborJob },
+  ];
+
+  // ---- runtime state -----------------------------------------------------
+  let state = 'idle'; // 'idle' | 'running' | 'celebrating' | 'freeroam'
+  let missionIndex = 0;
+  let mission = null; // { title, reward, timeLimit, steps }
+  let stepIndex = 0;
+  let step = null;
+  let baseObjective = '';
+  let timeLeft = 0;
+  let stepTime = 0;
+  let celebrateLeft = 0;
+  let pendingNext = -1;
+  let elapsed = 0;
+
+  let missionCars = [];
+  let prop = null; // glowing package / crate group for the current pickup step
+
+  const api = {
+    current: { title: FREE_ROAM.title, objective: FREE_ROAM.objective },
+    marker: null,
     active: false,
-    done: G.missionsDone || false,
-    targetPos: null,
-    beacon: null,
-    markedCar: null,
-    packageMesh: null,
-    pickups: [],
-    pickupTimer: 0,
-  };
-  G.missions = M;
-  G.missionIndex = M.index;
-  G.missionsDone = M.done;
-
-  M.beacon = makeBeacon(0xffd23e);
-  M.beacon.visible = false;
-  G.scene.add(M.beacon);
-
-  M.setObjective = (text) => {
-    G.ui.setObjective(text);
+    completedCount: 0,
+    totalCount: MISSIONS.length,
+    update,
+    objectiveText,
+    startFrom,
   };
 
-  M.spawnMarkedCar = () => {
-    // A flashy car a couple of blocks away, on a road — never right next to
-    // the player, so the "go steal it" step means a real trip.
-    const p = G.playerPos();
-    const roads = G.city.roadCoords;
-    let x = 0, z = 0;
-    for (let tries = 0; tries < 20; tries++) {
-      const road = roads[Math.floor(G.rng() * roads.length)];
-      const along = -150 + G.rng() * 300;
-      x = road + 3; z = along;
-      if (Math.hypot(x - p.x, z - p.z) > 40) break;
+  // ---- small helpers -----------------------------------------------------
+
+  function playerPos() {
+    return player.group.position;
+  }
+
+  function distTo(x, z) {
+    const p = playerPos();
+    const dx = p.x - x;
+    const dz = p.z - z;
+    return Math.sqrt(dx * dx + dz * dz);
+  }
+
+  function setMarker(x, z) {
+    api.marker = { x, z };
+    beacon.visible = true;
+    beacon.position.set(x, 0, z);
+  }
+
+  function clearMarker() {
+    api.marker = null;
+    beacon.visible = false;
+  }
+
+  function formatObjective() {
+    if (mission && mission.timeLimit > 0 && state === 'running') {
+      const secs = Math.max(0, Math.ceil(timeLeft));
+      return `${baseObjective} — ${secs}s left`;
     }
-    const car = spawnCar(G, x, z, 0, { color: 0xffd23e, marked: true, parked: true, hasDriver: false });
-    M.markedCar = car;
+    return baseObjective;
+  }
+
+  function refreshObjective() {
+    api.current = {
+      title: mission ? mission.title : api.current.title,
+      objective: formatObjective(),
+    };
+  }
+
+  function objectiveText() {
+    if (state === 'running' && mission) return formatObjective();
+    return api.current.objective;
+  }
+
+  function notify(title, sub) {
+    if (ctx.notify) ctx.notify(title, sub);
+  }
+
+  function addHeat(kind, times) {
+    for (let i = 0; i < times; i++) wanted.report(kind);
+  }
+
+  // ---- world beacon ------------------------------------------------------
+  // A translucent light pillar + a floating ring + a soft ground disc, all
+  // parented to one group that we move to whatever the current marker is.
+
+  const beacon = new THREE.Group();
+  {
+    const pillarMat = new THREE.MeshBasicMaterial({
+      color: BEACON_COLOR,
+      transparent: true,
+      opacity: 0.3,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+    });
+    const pillar = new THREE.Mesh(
+      new THREE.CylinderGeometry(1.5, 1.5, 38, 20, 1, true),
+      pillarMat
+    );
+    pillar.position.y = 19;
+    beacon.add(pillar);
+    beacon.userData.pillarMat = pillarMat;
+
+    const ringMat = new THREE.MeshBasicMaterial({
+      color: BEACON_COLOR,
+      transparent: true,
+      opacity: 0.85,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+    });
+    const ring = new THREE.Mesh(new THREE.TorusGeometry(3.4, 0.14, 10, 44), ringMat);
+    ring.rotation.x = Math.PI / 2;
+    ring.position.y = 1.1;
+    beacon.add(ring);
+    beacon.userData.ring = ring;
+
+    const discMat = new THREE.MeshBasicMaterial({
+      color: BEACON_COLOR,
+      transparent: true,
+      opacity: 0.18,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+    });
+    const disc = new THREE.Mesh(new THREE.CircleGeometry(3.4, 32), discMat);
+    disc.rotation.x = -Math.PI / 2;
+    disc.position.y = 0.12;
+    beacon.add(disc);
+  }
+  beacon.visible = false;
+  scene.add(beacon);
+
+  // ---- pickup props (package / cash crate) --------------------------------
+
+  function spawnProp(kind, x, z) {
+    removeProp();
+    const isCrate = kind === 'crate';
+    const color = isCrate ? CRATE_COLOR : PACKAGE_COLOR;
+    const group = new THREE.Group();
+
+    const body = new THREE.Mesh(
+      new THREE.BoxGeometry(1.15, 0.8, 1.15),
+      new THREE.MeshStandardMaterial({
+        color,
+        emissive: color,
+        emissiveIntensity: 0.55,
+        roughness: 0.45,
+        metalness: 0.1,
+      })
+    );
+    body.position.y = 0.75;
+    group.add(body);
+
+    const lid = new THREE.Mesh(
+      new THREE.BoxGeometry(1.3, 0.18, 1.3),
+      new THREE.MeshStandardMaterial({
+        color: 0x22242a,
+        emissive: color,
+        emissiveIntensity: 0.25,
+        roughness: 0.6,
+        metalness: 0.2,
+      })
+    );
+    lid.position.y = 1.22;
+    group.add(lid);
+
+    const glow = new THREE.PointLight(color, 7, 13, 1.6);
+    glow.position.y = 1.6;
+    group.add(glow);
+
+    group.position.set(x, 0, z);
+    group.userData.body = body;
+    scene.add(group);
+    prop = group;
+  }
+
+  function removeProp() {
+    if (prop) {
+      scene.remove(prop);
+      prop = null;
+    }
+  }
+
+  // ---- mission cars --------------------------------------------------------
+
+  function spawnMissionCar(x, z, angle, color, kind) {
+    const car = makeCar(scene, { x, z, angle, color, kind });
+    car.missionCar = true;
+    car.spawnInfo = { x, z, angle, color, kind };
+    missionCars.push(car);
     return car;
-  };
+  }
 
-  M.pickTargetSpot = (kind) => {
-    const p = G.playerPos();
-    const roads = G.city.roadCoords;
-    // Pick a spot at least 60 units away from the player.
-    for (let tries = 0; tries < 20; tries++) {
-      const road = roads[Math.floor(G.rng() * roads.length)];
-      const along = -180 + G.rng() * 360;
-      const horizontal = G.rng() < 0.5;
-      const x = horizontal ? along : road + 3;
-      const z = horizontal ? road + 3 : along;
-      if (Math.hypot(x - p.x, z - p.z) > 60) {
-        if (kind === 'beach') return new THREE.Vector3(60 + (G.rng() - 0.5) * 40, 0, 198);
-        return new THREE.Vector3(x, 0, z);
+  function removeMissionCars() {
+    for (const car of missionCars) {
+      // If the player is sitting in a mission car that is about to vanish,
+      // put them back on the street where the car was instead of leaving
+      // the player controller pointing at a removed group.
+      if (player.car === car) {
+        player.group.position.copy(car.group.position);
+        player.car = null;
       }
+      scene.remove(car.group);
     }
-    return new THREE.Vector3(60, 0, 120);
-  };
+    missionCars = [];
+  }
 
-  M.startMission = (idx) => {
-    M.index = idx;
-    M.step = 0;
-    M.active = true;
-    G.missionIndex = idx;
-    const def = MISSION_DEFS[idx];
-    if (!def) { M.finishAll(); return; }
-    G.ui.toast('MISSION ' + def.id + ': ' + def.name);
-    G.audio.chime();
-    M.startStep();
-  };
+  // If the car a step depends on gets destroyed, quietly replace it at its
+  // original spawn point and rewire every step that referenced the wreck.
+  function ensureCarAlive(ownerStep) {
+    const car = ownerStep.car;
+    if (!car || !car.dead) return;
+    const info = car.spawnInfo;
+    scene.remove(car.group);
+    missionCars = missionCars.filter((c) => c !== car);
+    const fresh = spawnMissionCar(info.x, info.z, info.angle, info.color, info.kind);
+    for (const s of mission.steps) {
+      if (s.car === car) s.car = fresh;
+    }
+    if (step && step.car === fresh && step.type === 'steal') {
+      setMarker(info.x, info.z);
+    }
+    notify('Vehicle Wrecked', 'The car was wrecked — a replacement waits.');
+  }
 
-  M.startStep = () => {
-    const def = MISSION_DEFS[M.index];
-    const stepDef = def.steps[M.step];
-    M.setObjective(def.name + ' — ' + stepDef.text);
-    if (stepDef.timed) M.timer = stepDef.timed;
-    const p = G.playerPos();
-    if (stepDef.target === 'markedCar') {
-      if (!M.markedCar) M.spawnMarkedCar();
-      M.targetPos = M.markedCar.mesh.position.clone();
-    } else if (stepDef.target === 'deliver') {
-      M.targetPos = M.pickTargetSpot('deliver');
-    } else if (stepDef.target === 'package') {
-      M.targetPos = M.pickTargetSpot('package');
-      if (!M.packageMesh) {
-        M.packageMesh = makePickupMesh();
-        M.packageMesh.scale.setScalar(1.4);
-        G.scene.add(M.packageMesh);
+  function cleanupMission() {
+    removeProp();
+    removeMissionCars();
+    mission = null;
+    step = null;
+    clearMarker();
+  }
+
+  // ======================================================================
+  // The five jobs. Each build() runs at mission start (and on restart), so
+  // every car it spawns is fresh and every step closes over live objects.
+  // ======================================================================
+
+  // 1 — First Wheels: a soft introduction. Meet the contact, lift the gold
+  // convertible he marked, and park it in the downtown garage.
+  function buildFirstWheels() {
+    const convertible = spawnMissionCar(124, 188, -Math.PI / 2, 0xffc21c, 'sport');
+    return [
+      {
+        type: 'goto', x: 120, z: 196, r: 6,
+        text: 'Meet your contact on the boardwalk at the beach.',
+      },
+      {
+        type: 'steal', car: convertible,
+        text: 'Steal the gold convertible your contact marked.',
+      },
+      {
+        type: 'deliver', car: convertible, x: -40, z: -36, r: 9,
+        text: 'Deliver the convertible to the downtown garage.',
+      },
+    ];
+  }
+
+  // 2 — Beach Run: the package is hot. The moment it leaves the hut the
+  // harbor knows, so the run home is: shake the law, then walk it in.
+  function buildBeachRun() {
+    return [
+      {
+        type: 'pickup', x: -160, z: 208, r: 5, prop: 'package',
+        text: 'Pick up the package from the beach hut.',
+        onDone: () => {
+          // Six reports' worth of heat: one gunfire call that starts the
+          // sirens, then a pile of assault reports as witnesses phone in.
+          wanted.report('gunfire');
+          addHeat('assault', 5);
+          if (ctx.audio && ctx.audio.pickup) ctx.audio.pickup();
+          notify('Package Lifted', 'Somebody talked — the harbor is crawling with cops.');
+        },
+      },
+      {
+        type: 'escape',
+        text: 'Lose the cops — break away and let the heat die down.',
+      },
+      {
+        type: 'goto', x: 200, z: 160, r: 6, foot: true,
+        text: 'Deliver the package on foot to the marina drop point.',
+      },
+    ];
+  }
+
+  // 3 — Night Courier: a timed favor for the club. The sedan is waiting at
+  // the east depot; the door it needs to reach is across town, and the
+  // clock started the moment you agreed.
+  function buildNightCourier() {
+    const sedan = spawnMissionCar(200, -112, Math.PI, 0x9fb4c7, 'civil');
+    return [
+      {
+        type: 'goto', x: 200, z: -120, r: 7,
+        text: 'Get to the depot on the east side of the harbor.',
+      },
+      {
+        type: 'steal', car: sedan,
+        text: 'Take the waiting sedan — keys are in it.',
+      },
+      {
+        type: 'deliver', car: sedan, x: -120, z: 40, r: 9,
+        text: 'Deliver the sedan to the club door before time runs out.',
+      },
+    ];
+  }
+
+  // 4 — Harbor Heat: three cash crates, three neighborhoods, and every
+  // crate you touch makes the radio chatter louder. Cash out, cool off,
+  // then disappear into the safehouse.
+  function buildHarborHeat() {
+    const crateSpots = [
+      { x: 160, z: 120, label: 'the marina warehouse crate' },
+      { x: -80, z: 200, label: 'the beach boardwalk crate' },
+      { x: -200, z: -40, label: 'the west docks crate' },
+    ];
+    const steps = crateSpots.map((spot, i) => ({
+      type: 'pickup', x: spot.x, z: spot.z, r: 5, prop: 'crate',
+      text: `Collect cash crate ${i + 1} of 3 — ${spot.label}.`,
+      onDone: () => {
+        addHeat('propertyDamage', 3);
+        if (ctx.audio && ctx.audio.pickup) ctx.audio.pickup();
+        notify(
+          `Crate ${i + 1} Secured`,
+          i < 2 ? 'Heat is rising — keep moving.' : 'That is the last crate. Now vanish.'
+        );
+      },
+    }));
+    steps.push({
+      type: 'escape',
+      text: 'Lose the cops before you go anywhere near the safehouse.',
+    });
+    steps.push({
+      type: 'goto', x: -200, z: -160, r: 8,
+      text: 'Reach the safehouse in the northwest and lie low.',
+    });
+    return steps;
+  }
+
+  // 5 — The Vice Harbor Job: the finale. A magenta supercar owned by a man
+  // with friends in every precinct, and a buyer waiting at the far corner
+  // of the map. Steal it and the whole harbor lights up.
+  function buildViceHarborJob() {
+    const supercar = spawnMissionCar(-40, -200, 0, 0xff2fd6, 'sport');
+    return [
+      {
+        type: 'steal', car: supercar,
+        text: 'Steal the magenta supercar — its owner is connected, so expect trouble.',
+        onDone: () => {
+          wanted.report('copDown');
+          wanted.report('theft');
+          notify('Wrong Car, Wrong Owner', 'Every cop in Vice Harbor just got your description.');
+        },
+      },
+      {
+        type: 'deliver', car: supercar, x: 220, z: -220, r: 10,
+        text: 'Deliver the supercar to the buyer at the far northeast drop.',
+      },
+    ];
+  }
+
+  // ======================================================================
+  // Step engine
+  // ======================================================================
+
+  function enterStep() {
+    step = mission.steps[stepIndex];
+    stepTime = 0;
+    baseObjective = step.text;
+    removeProp();
+
+    switch (step.type) {
+      case 'goto':
+      case 'deliver':
+        setMarker(step.x, step.z);
+        break;
+      case 'pickup':
+        setMarker(step.x, step.z);
+        spawnProp(step.prop || 'package', step.x, step.z);
+        break;
+      case 'steal': {
+        const p = step.car.group.position;
+        setMarker(p.x, p.z);
+        break;
       }
-      M.packageMesh.visible = true;
-      M.packageMesh.position.set(M.targetPos.x, 1.2, M.targetPos.z);
-    } else if (stepDef.target === 'dropoff') {
-      M.targetPos = M.pickTargetSpot('dropoff');
-      if (M.packageMesh) M.packageMesh.visible = false;
-    } else if (stepDef.target === 'beach') {
-      M.targetPos = M.pickTargetSpot('beach');
+      case 'escape':
+        clearMarker();
+        break;
+      default:
+        clearMarker();
+        break;
     }
-    M.beacon.position.set(M.targetPos.x, 30, M.targetPos.z);
-    M.beacon.visible = true;
-  };
+    refreshObjective();
+  }
 
-  M.completeStep = () => {
-    const def = MISSION_DEFS[M.index];
-    G.audio.chime();
-    G.save();
-    M.step++;
-    if (M.step >= def.steps.length) {
-      M.completeMission();
+  function advanceStep() {
+    const finished = step;
+    if (finished.type === 'pickup') {
+      removeProp();
+      if (ctx.audio && ctx.audio.pickup) ctx.audio.pickup();
+    }
+    if (finished.onDone) finished.onDone();
+
+    stepIndex += 1;
+    if (stepIndex >= mission.steps.length) {
+      completeMission();
     } else {
-      M.startStep();
+      enterStep();
     }
-  };
+  }
 
-  M.completeMission = () => {
-    const def = MISSION_DEFS[M.index];
-    G.player.cash += def.reward;
-    G.ui.toast('MISSION COMPLETE — +$' + def.reward);
-    G.audio.chime();
-    M.beacon.visible = false;
-    M.targetPos = null;
-    M.active = false;
-    if (M.markedCar) {
-      M.markedCar.marked = false;
-      if (M.markedCar.markerRing) M.markedCar.markerRing.visible = false;
-      M.markedCar = null;
-    }
-    M.index++;
-    G.missionIndex = M.index;
-    G.save();
-    if (M.index >= MISSION_DEFS.length) {
-      M.finishAll();
-    } else {
-      setTimeout(() => { if (G.state === 'playing') M.startMission(M.index); }, 2500);
-    }
-  };
+  function completeMission() {
+    const doneIndex = missionIndex;
+    const reward = mission.reward;
+    const title = mission.title;
 
-  M.finishAll = () => {
-    M.done = true;
-    G.missionsDone = true;
-    M.active = false;
-    M.setObjective('All missions done — free roam! Grab cash pickups, stay out of trouble.');
-    G.save();
-  };
+    ctx.addCash(reward);
+    if (ctx.audio && ctx.audio.cash) ctx.audio.cash();
+    if (ctx.audio && ctx.audio.missionDone) ctx.audio.missionDone();
 
-  M.checkStep = () => {
-    if (!M.active || !M.targetPos) return;
-    const def = MISSION_DEFS[M.index];
-    if (!def) return;
-    const stepDef = def.steps[M.step];
-    const p = G.playerPos();
-    const d = Math.hypot(p.x - M.targetPos.x, p.z - M.targetPos.z);
-    if (stepDef.target === 'markedCar') {
-      // Step completes when the player is driving the marked car.
-      if (!G.player.onFoot && G.player.vehicle === M.markedCar) {
-        M.completeStep();
-        return;
-      }
-      // Keep the beacon glued to the car.
-      M.targetPos.copy(M.markedCar.mesh.position);
-      M.beacon.position.set(M.targetPos.x, 30, M.targetPos.z);
+    cleanupMission();
+    api.completedCount = doneIndex + 1;
+
+    if (doneIndex >= MISSIONS.length - 1) {
+      // Campaign finished — straight into free roam with the final word.
+      missionIndex = MISSIONS.length;
+      state = 'freeroam';
+      api.active = false;
+      baseObjective = FREE_ROAM.objective;
+      api.current = { title: FREE_ROAM.title, objective: FREE_ROAM.objective };
+      notify(
+        'The Vice Harbor Job — Complete',
+        `+$${reward}. Every job done — the harbor is yours.`
+      );
       return;
     }
-    if (d < stepDef.radius) {
-      // A delivery only counts while driving the mission car — walking to
-      // the marker on foot is not a delivery.
-      if (stepDef.target === 'deliver' && G.player.vehicle !== M.markedCar) {
+
+    // Brief celebration beat, then the next job starts itself.
+    state = 'celebrating';
+    api.active = false;
+    celebrateLeft = 3;
+    pendingNext = doneIndex + 1;
+    baseObjective = `${title} done. Next job starts in 3 seconds.`;
+    api.current = { title: 'Mission Complete', objective: baseObjective };
+    notify('Mission Complete', `${title} — +$${reward}.`);
+  }
+
+  function failMission() {
+    const restartIndex = missionIndex;
+    const title = mission.title;
+    notify('Mission Failed', `${title} — out of time. The job resets.`);
+    cleanupMission();
+    startMission(restartIndex);
+  }
+
+  function startMission(index) {
+    cleanupMission();
+    missionIndex = index;
+    const def = MISSIONS[index];
+    mission = {
+      title: def.title,
+      reward: def.reward,
+      timeLimit: def.timeLimit,
+      steps: def.build(),
+    };
+    timeLeft = def.timeLimit;
+    stepIndex = 0;
+    state = 'running';
+    api.active = true;
+    api.completedCount = index;
+    enterStep();
+    notify(def.title, baseObjective);
+  }
+
+  function setFreeRoam() {
+    cleanupMission();
+    missionIndex = MISSIONS.length;
+    state = 'freeroam';
+    api.active = false;
+    api.completedCount = MISSIONS.length;
+    baseObjective = FREE_ROAM.objective;
+    api.current = { title: FREE_ROAM.title, objective: FREE_ROAM.objective };
+  }
+
+  // Boot / resume entry point: begin at the given 0-based mission index
+  // (the save system stores where the player left off). Past the end means
+  // the campaign is done and the harbor is open.
+  function startFrom(index) {
+    const i = Math.max(0, Math.floor(index) || 0);
+    if (i >= MISSIONS.length) {
+      setFreeRoam();
+    } else {
+      startMission(i);
+    }
+  }
+
+  // ======================================================================
+  // Per-frame update: beacon pulse, prop bob, timers, step checks.
+  // ======================================================================
+
+  function update(dt) {
+    elapsed += dt;
+
+    // Beacon animation — pillar breathing, ring slowly spinning and the
+    // whole pillar bobbing a breath above the street.
+    if (beacon.visible && api.marker) {
+      beacon.position.set(api.marker.x, Math.sin(elapsed * 2) * 0.15, api.marker.z);
+      beacon.userData.pillarMat.opacity = 0.24 + 0.12 * (0.5 + 0.5 * Math.sin(elapsed * 4));
+      const ring = beacon.userData.ring;
+      ring.rotation.z += dt * 0.9;
+      const s = 1 + 0.13 * Math.sin(elapsed * 4);
+      ring.scale.set(s, s, 1);
+    }
+
+    // Pickup prop: slow spin and a gentle hover bob.
+    if (prop) {
+      prop.rotation.y += dt * 1.4;
+      prop.position.y = 0.15 + 0.12 * (0.5 + 0.5 * Math.sin(elapsed * 3));
+    }
+
+    // Between missions: count down the celebration, then roll into the
+    // next job on its own.
+    if (state === 'celebrating') {
+      celebrateLeft -= dt;
+      if (celebrateLeft <= 0 && pendingNext >= 0) {
+        const next = pendingNext;
+        pendingNext = -1;
+        startMission(next);
+      }
+      return;
+    }
+
+    if (state !== 'running' || !mission || !step) return;
+
+    stepTime += dt;
+
+    // Timed jobs (Night Courier): the clock is always running, and an
+    // expired clock fails the job and restarts it fresh.
+    if (mission.timeLimit > 0) {
+      timeLeft -= dt;
+      refreshObjective();
+      if (timeLeft <= 0) {
+        failMission();
         return;
       }
-      if (stepDef.target === 'package') {
-        G.ui.toast('Package secured! Now deliver it.');
-        G.wantedSystem.add(2, 'Package job — the law is on you');
-      }
-      M.completeStep();
     }
-  };
 
-  M.update = (dt) => {
-    if (M.active) {
-      const def = MISSION_DEFS[M.index];
-      if (def) {
-        const stepDef = def.steps[M.step];
-        if (stepDef && stepDef.timed) {
-          M.timer -= dt;
-          G.ui.setTimer(Math.max(0, M.timer));
-          if (M.timer <= 0) {
-            G.ui.setTimer(null);
-            G.ui.toast('Too slow! Mission failed — try again.');
-            M.active = false;
-            M.beacon.visible = false;
-            M.targetPos = null;
-            setTimeout(() => { if (G.state === 'playing') M.startMission(M.index); }, 3000);
-            return;
-          }
-        } else {
-          G.ui.setTimer(null);
+    // A wrecked mission car is replaced at its spawn point, whatever step
+    // we are on — the job must always stay finishable.
+    if (step.car) ensureCarAlive(step);
+
+    switch (step.type) {
+      case 'goto': {
+        if (step.foot && player.car) break; // this one has to be on foot
+        if (distTo(step.x, step.z) <= step.r) advanceStep();
+        break;
+      }
+      case 'steal': {
+        // Keep the beacon glued to the target car until it is taken.
+        const p = step.car.group.position;
+        setMarker(p.x, p.z);
+        if (player.car === step.car) advanceStep();
+        break;
+      }
+      case 'deliver': {
+        if (player.car === step.car && distTo(step.x, step.z) <= step.r) {
+          advanceStep();
         }
+        break;
       }
-      M.checkStep();
-    }
-    // Cash pickups: spawn a few, collect on touch.
-    M.pickupTimer -= dt;
-    if (M.pickups.length < 5 && M.pickupTimer <= 0) {
-      M.pickupTimer = 6;
-      const spot = M.pickTargetSpot('pickup');
-      const mesh = makePickupMesh();
-      mesh.position.set(spot.x, 1.0, spot.z);
-      G.scene.add(mesh);
-      M.pickups.push({ mesh, spin: G.rng() * 6 });
-    }
-    const p = G.playerPos();
-    for (let i = M.pickups.length - 1; i >= 0; i--) {
-      const pk = M.pickups[i];
-      pk.mesh.rotation.y += dt * 2;
-      pk.mesh.position.y = 1.0 + Math.sin(G.time * 2 + pk.spin) * 0.25;
-      if (Math.hypot(p.x - pk.mesh.position.x, p.z - pk.mesh.position.z) < 2.2) {
-        G.player.cash += 50;
-        G.audio.chime();
-        G.ui.toast('+$50 cash pickup');
-        G.scene.remove(pk.mesh);
-        M.pickups.splice(i, 1);
-        G.save();
+      case 'pickup': {
+        if (distTo(step.x, step.z) <= step.r) advanceStep();
+        break;
       }
+      case 'escape': {
+        // A beat of grace so a heat spike that has not landed yet cannot
+        // make the step complete (or look broken) in the same frame.
+        if (stepTime > 0.75 && wanted.level === 0) advanceStep();
+        break;
+      }
+      default:
+        break;
     }
-    if (M.beacon.visible) {
-      M.beacon.rotation.y += dt * 0.6;
-      M.beacon.material.opacity = 0.22 + Math.sin(G.time * 3) * 0.08;
-    }
-  };
+  }
 
-  return M;
+  return api;
 }

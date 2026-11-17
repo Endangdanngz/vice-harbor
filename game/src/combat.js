@@ -1,118 +1,156 @@
-// combat.js — pistol hitscan, muzzle flash, damage + wanted consequences.
-import * as THREE from 'three';
-import { hurtPed, scarePeds } from './pedestrians.js';
+// combat.js — hitscan gunfire for Vice Harbor: ray-vs-vertical-segment
+// target tests, pooled tracers, impact puffs and a reusable muzzle
+// flash light. Rate limiting lives with the caller; this module only
+// resolves and presents each shot.
+import * as THREE from '../vendor/three.module.min.js';
 
-export function createCombat(G) {
-  const C = {
-    cooldown: 0,
-    flash: null,
-    flashTimer: 0,
-    gun: null,
-  };
+const MAX_RANGE = 90;
+const CLOSE_DAMAGE = 34;   // t < 25
+const FAR_DAMAGE = 22;     // t >= 25
+const CLOSE_RANGE = 25;
+const TRACER_LIFE = 0.06;  // seconds (60 ms)
+const PUFF_LIFE = 0.28;
+const TRACER_COUNT = 8;
+const PUFF_COUNT = 10;
 
-  // Simple viewmodel pistol attached to the camera.
-  const gun = new THREE.Group();
-  const gunMat = new THREE.MeshStandardMaterial({ color: 0x22222e, roughness: 0.4, metalness: 0.6 });
-  const barrel = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.07, 0.34), gunMat);
-  barrel.position.set(0, 0, -0.1);
-  const grip = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.16, 0.07), gunMat);
-  grip.position.set(0, -0.09, 0.04);
-  grip.rotation.x = 0.25;
-  gun.add(barrel); gun.add(grip);
-  gun.position.set(0.32, -0.28, -0.75);
-  gun.scale.setScalar(0.55);
-  G.camera.add(gun);
-  C.gun = gun;
+export function createCombat(scene, audio) {
+  // One reusable muzzle flash light, repositioned on every shot.
+  const flash = new THREE.PointLight(0xffa040, 0, 20, 1.8);
+  flash.visible = false;
+  scene.add(flash);
 
-  // Muzzle flash: a small additive sprite at the barrel tip.
-  const flashMat = new THREE.MeshBasicMaterial({
-    color: 0xffe9a8, transparent: true, opacity: 0, blending: THREE.AdditiveBlending,
-    depthWrite: false,
-  });
-  const flash = new THREE.Mesh(new THREE.PlaneGeometry(0.34, 0.34), flashMat);
-  flash.position.set(0.32, -0.24, -1.0);
-  G.camera.add(flash);
-  C.flash = flash;
-  C.flashLight = new THREE.PointLight(0xffc46b, 0, 9);
-  C.flashLight.position.set(0.32, -0.24, -1.0);
-  G.camera.add(C.flashLight);
+  // Tracer pool: additive lines, each with its own position buffer.
+  const tracers = [];
+  for (let i = 0; i < TRACER_COUNT; i++) {
+    const positions = new Float32Array(6);
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    const mat = new THREE.LineBasicMaterial({
+      color: 0xfff3b0,
+      transparent: true,
+      opacity: 0,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+    });
+    const line = new THREE.Line(geo, mat);
+    line.visible = false;
+    line.frustumCulled = false;
+    scene.add(line);
+    tracers.push({ line, positions, life: 0 });
+  }
+  let tracerCursor = 0;
 
-  const raycaster = new THREE.Raycaster();
-  raycaster.far = 80;
+  // Impact puff pool: small warm spheres that swell and fade.
+  const puffs = [];
+  const puffGeo = new THREE.SphereGeometry(0.14, 10, 8);
+  for (let i = 0; i < PUFF_COUNT; i++) {
+    const mat = new THREE.MeshBasicMaterial({
+      color: 0xffd9a0,
+      transparent: true,
+      opacity: 0,
+      depthWrite: false,
+    });
+    const mesh = new THREE.Mesh(puffGeo, mat);
+    mesh.visible = false;
+    scene.add(mesh);
+    puffs.push({ mesh, life: 0 });
+  }
+  let puffCursor = 0;
 
-  C.tryShoot = () => {
-    if (G.state !== 'playing' || C.cooldown > 0) return;
-    if (!G.player.onFoot) return; // no drive-by shooting in v1
-    C.cooldown = 0.28;
-    G.audio.gunshot();
-    C.flash.material.opacity = 0.95;
-    C.flashLight.intensity = 6;
-    C.flashTimer = 0.06;
-    // Tiny camera kick.
-    G.camPitch += 0.012;
+  const _center = new THREE.Vector3();
+  const _rel = new THREE.Vector3();
+  const _closest = new THREE.Vector3();
+  const _end = new THREE.Vector3();
 
-    raycaster.setFromCamera({ x: 0, y: 0 }, G.camera);
-    const px = G.player.pos.x, pz = G.player.pos.z;
-    scarePeds(G, px, pz, 30);
+  function spawnTracer(from, to) {
+    const tr = tracers[tracerCursor];
+    tracerCursor = (tracerCursor + 1) % tracers.length;
+    tr.positions[0] = from.x; tr.positions[1] = from.y; tr.positions[2] = from.z;
+    tr.positions[3] = to.x; tr.positions[4] = to.y; tr.positions[5] = to.z;
+    tr.line.geometry.attributes.position.needsUpdate = true;
+    tr.life = TRACER_LIFE;
+    tr.line.material.opacity = 0.95;
+    tr.line.visible = true;
+  }
 
-    // Hit test against peds first.
-    let hitSomething = false;
-    for (const ped of G.peds) {
-      if (ped.dead) continue;
-      const toPed = new THREE.Vector3(
-        ped.mesh.position.x - G.camera.position.x,
-        1.2 - G.camera.position.y,
-        ped.mesh.position.z - G.camera.position.z
-      );
-      const dist = toPed.length();
-      if (dist > 80) continue;
-      const dir = raycaster.ray.direction;
-      const dot = toPed.normalize().dot(dir);
-      const perp = Math.sqrt(Math.max(0, 1 - dot * dot)) * dist;
-      if (dot > 0 && perp < 1.1) {
-        const down = hurtPed(G, ped, 100, px, pz);
-        G.wantedSystem.add(1, down ? 'Pedestrian down' : 'Pedestrian shot');
-        hitSomething = true;
-        break;
+  function spawnPuff(at) {
+    const puff = puffs[puffCursor];
+    puffCursor = (puffCursor + 1) % puffs.length;
+    puff.mesh.position.copy(at);
+    puff.mesh.scale.setScalar(1);
+    puff.mesh.material.opacity = 0.9;
+    puff.mesh.visible = true;
+    puff.life = PUFF_LIFE;
+  }
+
+  // origin/dir are THREE.Vector3 (dir normalized). targets carry a base
+  // height y and a vertical extent height; a shot connects when the ray
+  // passes within radius + slack of the segment's midpoint projection.
+  function shoot(origin, dir, targets) {
+    if (audio) audio.shot();
+
+    flash.position.copy(origin);
+    flash.intensity = 3;
+    flash.visible = true;
+
+    let best = null;
+    let bestT = Infinity;
+    for (const target of targets || []) {
+      _center.set(target.x, target.y + target.height / 2, target.z);
+      _rel.copy(_center).sub(origin);
+      const t = _rel.dot(dir);
+      if (t <= 0 || t > MAX_RANGE || t >= bestT) continue;
+      _closest.copy(origin).addScaledVector(dir, t);
+      const perp = _closest.distanceTo(_center);
+      if (perp < target.radius + 0.15) {
+        best = target;
+        bestT = t;
       }
     }
-    if (hitSomething) return;
-    // Then police cars.
-    for (const car of G.cars) {
-      if (!car.police) continue;
-      const toCar = new THREE.Vector3(
-        car.mesh.position.x - G.camera.position.x,
-        0.8 - G.camera.position.y,
-        car.mesh.position.z - G.camera.position.z
-      );
-      const dist = toCar.length();
-      if (dist > 80) continue;
-      const dir = raycaster.ray.direction;
-      const dot = toCar.normalize().dot(dir);
-      const perp = Math.sqrt(Math.max(0, 1 - dot * dot)) * dist;
-      if (dot > 0 && perp < 2.0) {
-        G.wantedSystem.add(1, 'Shot at police');
-        G.ui.toast('You shot at the police!');
-        return;
+
+    const range = best ? bestT : MAX_RANGE;
+    _end.copy(origin).addScaledVector(dir, range);
+    spawnTracer(origin, _end);
+
+    if (best) {
+      const dmg = bestT < CLOSE_RANGE ? CLOSE_DAMAGE : FAR_DAMAGE;
+      best.onHit(dmg);
+      if (audio) audio.hit();
+      spawnPuff(_end);
+      return { target: best, point: _end.clone(), t: bestT, damage: dmg };
+    }
+    return null;
+  }
+
+  function update(dt) {
+    // Muzzle flash: spike on shoot, decay fast.
+    if (flash.visible) {
+      flash.intensity = Math.max(0, flash.intensity - dt * 55);
+      if (flash.intensity <= 0) flash.visible = false;
+    }
+    for (const tr of tracers) {
+      if (!tr.line.visible) continue;
+      tr.life -= dt;
+      if (tr.life <= 0) {
+        tr.line.visible = false;
+        tr.line.material.opacity = 0;
+      } else {
+        tr.line.material.opacity = 0.95 * (tr.life / TRACER_LIFE);
       }
     }
-    // Firing a weapon in public still draws attention.
-    if (G.wantedSystem.level === 0) G.wantedSystem.add(1, 'Shots fired');
-  };
-
-  C.update = (dt) => {
-    if (C.cooldown > 0) C.cooldown -= dt;
-    if (C.flashTimer > 0) {
-      C.flashTimer -= dt;
-      if (C.flashTimer <= 0) {
-        C.flash.material.opacity = 0;
-        C.flashLight.intensity = 0;
+    for (const puff of puffs) {
+      if (!puff.mesh.visible) continue;
+      puff.life -= dt;
+      if (puff.life <= 0) {
+        puff.mesh.visible = false;
+        puff.mesh.material.opacity = 0;
+      } else {
+        const k = puff.life / PUFF_LIFE;
+        puff.mesh.scale.setScalar(1 + (1 - k) * 2.6);
+        puff.mesh.material.opacity = 0.9 * k;
       }
     }
-    C.gun.visible = G.player.onFoot && G.state === 'playing';
-    C.flash.visible = C.gun.visible;
-  };
+  }
 
-  G.combat = C;
-  return C;
+  return { shoot, update };
 }

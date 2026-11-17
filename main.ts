@@ -1,74 +1,112 @@
-// A working gta6-01 entry (Node 22, standard library only): the game is this directory's
-// game/ folder, plain static files a desktop browser loads offline (game/index.html and its ES
-// modules, no library and no network request), and the program hands it in. It copies game/ and
-// screenshots/ from beside this file to /output and writes /output/dossier.json, the summary the
-// judge reads, with the vendored make.fun library. Only the plumbing, not an open world: Block
-// Dodger, a plain 2D canvas game where a paddle dodges falling blocks and catches coins, with a
-// title screen, score, lives and levels, game over and restart, flat colours and no sound. Build
-// your own open-world crime game in its place (three.js or any library you vendor under game/),
-// put your 3 or 4 PNG or JPEG screenshots in screenshots/ (the first by name is the cover) and run it.
+// Vice Harbor — entry program for the make.fun gta6-01 bounty.
 //
-// Serve it locally with `node serve.ts`, then open http://localhost:8080.
-// Outside the grader's container, MAKEFUN_OUTPUT_DIR stands in for /output:
-//   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
+// Runs as-is with plain `node main.ts` (Node 24 type-stripping: no build
+// step, no dependencies beyond the Node standard library and the vendored
+// make.fun game library). It validates the entry, copies game/ and
+// screenshots/ into the output directory, builds the dossier from those
+// copies with buildDossier, and writes it to <out>/dossier.json.
 
 import { cpSync, existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { extname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { buildDossier } from './vendor/makefun-game.ts';
 
-const here = fileURLToPath(new URL('.', import.meta.url));
-const out = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+/** Where the packaged entry goes: MAKEFUN_OUTPUT_DIR, or ./out by default. */
+const OUT_DIR = process.env.MAKEFUN_OUTPUT_DIR || 'out';
+/** The repository root this program runs from. */
+const ROOT = process.cwd();
 
-// ---------- Preflight validation (Vice Harbor) ----------
-// Fail fast with a clear message when the entry on disk is not submittable,
-// instead of copying a broken folder into /output and letting the scorer
-// reject it later. These mirror the caps buildDossier enforces below.
-const SCREENSHOT_MAX_BYTES = 256 * 1024; // 256 KiB per screenshot
-const IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg']);
+/** Preflight caps, mirroring the bounty's gate. */
+const MAX_SCREENSHOT_BYTES = 256 * 1024; // 256 KiB per screenshot
+const MAX_GAME_BYTES = 48 * 1024 * 1024; // 48 MiB across all of game/
+const IMAGE_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png']);
 
-function preflight() {
-  const entryPoint = join(here, 'game', 'index.html');
-  if (!existsSync(entryPoint)) {
-    throw new Error(`preflight: game/index.html is missing (looked for ${entryPoint}) — the game folder is incomplete`);
-  }
-  const shotsDir = join(here, 'screenshots');
-  if (!existsSync(shotsDir)) {
-    throw new Error('preflight: screenshots/ is missing — capture 3 or 4 screenshots of the game first');
-  }
-  const shots = readdirSync(shotsDir)
-    .filter((name) => IMAGE_EXTENSIONS.has(extname(name).toLowerCase()))
-    .sort();
-  if (shots.length < 3 || shots.length > 4) {
-    throw new Error(`preflight: screenshots/ must hold 3 or 4 images, found ${shots.length} (${shots.join(', ') || 'none'})`);
-  }
-  for (const name of shots) {
-    const size = statSync(join(shotsDir, name)).size;
-    if (size > SCREENSHOT_MAX_BYTES) {
-      throw new Error(`preflight: screenshots/${name} is ${size} bytes, over the 256 KiB (${SCREENSHOT_MAX_BYTES} bytes) cap`);
-    }
-  }
-  console.log(`preflight: game/index.html present; ${shots.length} screenshots within the 256 KiB cap`);
+/** Refuse the run, naming the preflight check that failed. */
+function fail(check: string, detail: string): never {
+  throw new Error(`preflight failed [${check}]: ${detail}`);
 }
 
-preflight();
+/** Every file under dir, as paths relative to dir, in directory order. */
+function walkFiles(dir: string, prefix = ''): string[] {
+  const out: string[] = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const rel = prefix === '' ? entry.name : `${prefix}/${entry.name}`;
+    if (entry.isDirectory()) out.push(...walkFiles(join(dir, entry.name), rel));
+    else if (entry.isFile()) out.push(rel);
+  }
+  return out;
+}
 
-mkdirSync(out, { recursive: true });
-cpSync(join(here, 'game'), join(out, 'game'), { recursive: true });
-mkdirSync(join(out, 'screenshots'), { recursive: true });
-if (existsSync(join(here, 'screenshots'))) cpSync(join(here, 'screenshots'), join(out, 'screenshots'), { recursive: true });
+/** The game must ship its page: game/index.html, a real file. */
+function checkIndexHtml(): void {
+  const page = join(ROOT, 'game', 'index.html');
+  if (!existsSync(page) || !statSync(page).isFile()) {
+    fail('game/index.html', 'the game page is missing');
+  }
+}
 
-// The scorer's own caps (reference/gate.json): only text_max_bytes shapes the bytes; the others refuse an entry the
-// scorer would refuse (more than 4 screenshots or one over 256 KiB; more than 993 files in game/ or 48 MiB of game
-// files, in all, or a path under game/ over 1000 bytes: game/ counts beside /output's own 1000-entry cap, its
-// screenshots/ and dossier.json).
-writeFileSync(
-  join(out, 'dossier.json'),
-  buildDossier(out, {
+/** screenshots/ must hold 3–4 image files, each at most 256 KiB. */
+function checkScreenshots(): string[] {
+  const dir = join(ROOT, 'screenshots');
+  if (!existsSync(dir) || !statSync(dir).isDirectory()) {
+    fail('screenshots/', 'the screenshots directory is missing');
+  }
+  const images = readdirSync(dir)
+    .filter((name) => IMAGE_EXTENSIONS.has(extname(name).toLowerCase()))
+    .sort();
+  if (images.length < 3 || images.length > 4) {
+    fail('screenshots/', `expected 3-4 image files, found ${images.length}`);
+  }
+  for (const name of images) {
+    const bytes = statSync(join(dir, name)).size;
+    if (bytes > MAX_SCREENSHOT_BYTES) {
+      fail('screenshots/', `${name} is ${bytes} bytes, over the ${MAX_SCREENSHOT_BYTES}-byte cap`);
+    }
+  }
+  return images;
+}
+
+/** game/ as a whole must stay within the 48 MiB cap; returns its file count and total size. */
+function checkGameSize(): { files: number; bytes: number } {
+  const dir = join(ROOT, 'game');
+  if (!existsSync(dir) || !statSync(dir).isDirectory()) {
+    fail('game/', 'the game directory is missing');
+  }
+  const files = walkFiles(dir);
+  let bytes = 0;
+  for (const rel of files) bytes += statSync(join(dir, rel)).size;
+  if (bytes > MAX_GAME_BYTES) {
+    fail('game/', `game files total ${bytes} bytes, over the ${MAX_GAME_BYTES}-byte cap`);
+  }
+  return { files: files.length, bytes };
+}
+
+/**
+ * Package the entry: run the preflight checks, copy game/ and screenshots/
+ * into the output directory, then build the dossier from the copies (the
+ * scorer rebuilds it from exactly these files) and write dossier.json
+ * beside them.
+ */
+function main(): void {
+  checkIndexHtml();
+  const shots = checkScreenshots();
+  const game = checkGameSize();
+
+  mkdirSync(OUT_DIR, { recursive: true });
+  cpSync(join(ROOT, 'game'), join(OUT_DIR, 'game'), { recursive: true });
+  cpSync(join(ROOT, 'screenshots'), join(OUT_DIR, 'screenshots'), { recursive: true });
+
+  const dossier = buildDossier(OUT_DIR, {
     text_max_bytes: 163840,
     screenshots: { max: 4, max_bytes: 262144 },
     game_max_files: 993,
     game_max_bytes: 50331648,
-    game_path_max_bytes: 1000,
-  }),
-);
+  });
+  writeFileSync(join(OUT_DIR, 'dossier.json'), dossier);
+
+  const copied = game.files + shots.length;
+  console.log(
+    `vice-harbor: copied ${copied} files (game ${game.bytes} bytes, ${shots.length} screenshots) to ${OUT_DIR}; dossier.json ${dossier.byteLength} bytes`,
+  );
+}
+
+main();

@@ -1,165 +1,315 @@
-// player.js — on-foot character: mesh, movement, camera-relative controls, enter/exit.
-import * as THREE from 'three';
-import { collideBuildings, clampToCity } from './city.js';
-import { nearestCar } from './vehicles.js';
+// player.js — the on-foot / driving protagonist for Vice Harbor.
+// Builds a small articulated humanoid out of boxes (teal jacket, dark
+// pistol in the right hand), walks with a limb-swing cycle, sprints on
+// stamina, wades slowly through water, and takes over cars via stepCar.
+import * as THREE from '../vendor/three.module.min.js';
+import { stepCar } from './vehicles.js';
 
-export function makePlayerMesh() {
-  const p = new THREE.Group();
-  const jacket = new THREE.MeshStandardMaterial({ color: 0xff2ea6, roughness: 0.7 });
-  const pants = new THREE.MeshStandardMaterial({ color: 0x1c2a4a, roughness: 0.8 });
-  const skin = new THREE.MeshStandardMaterial({ color: 0xe8b98a, roughness: 0.7 });
-  const body = new THREE.Mesh(new THREE.BoxGeometry(0.62, 0.78, 0.36), jacket);
-  body.position.y = 1.05;
-  p.add(body);
-  const head = new THREE.Mesh(new THREE.SphereGeometry(0.26, 12, 10), skin);
-  head.position.y = 1.68;
-  p.add(head);
-  const cap = new THREE.Mesh(new THREE.CylinderGeometry(0.27, 0.27, 0.1, 12),
-    new THREE.MeshStandardMaterial({ color: 0x35f0ff, roughness: 0.5 }));
-  cap.position.y = 1.86;
-  p.add(cap);
-  for (const x of [-0.16, 0.16]) {
-    const leg = new THREE.Mesh(new THREE.BoxGeometry(0.22, 0.62, 0.24), pants);
-    leg.position.set(x, 0.36, 0);
-    p.add(leg);
-    p.userData['leg' + (x < 0 ? 'L' : 'R')] = leg;
-  }
-  for (const x of [-0.4, 0.4]) {
-    const arm = new THREE.Mesh(new THREE.BoxGeometry(0.16, 0.6, 0.18), jacket);
-    arm.position.set(x, 1.05, 0);
-    p.add(arm);
-    p.userData['arm' + (x < 0 ? 'L' : 'R')] = arm;
-  }
-  return p;
+const WALK_SPEED = 7;
+const SPRINT_SPEED = 11.5;
+const PLAYER_RADIUS = 0.45;
+const WORLD_BOUND = 262;
+const STAMINA_MAX = 100;
+const SPRINT_DRAIN = 24;   // per second while sprinting
+const STAMINA_REGEN = 15;  // per second while not sprinting
+const SPRINT_UNLOCK = 20;  // stamina needed after exhaustion to sprint again
+const ENTER_RANGE = 3.4;
+
+function box(w, h, d, color) {
+  const mesh = new THREE.Mesh(
+    new THREE.BoxGeometry(w, h, d),
+    new THREE.MeshLambertMaterial({ color })
+  );
+  mesh.castShadow = true;
+  return mesh;
 }
 
-export function createPlayer(G) {
-  const mesh = makePlayerMesh();
-  G.scene.add(mesh);
+// A limb that swings around a pivot at its top end: the pivot sits at the
+// joint (hip / shoulder) and the box hangs below it.
+function limb(w, h, d, color, x, y, z) {
+  const pivot = new THREE.Group();
+  pivot.position.set(x, y, z);
+  const mesh = box(w, h, d, color);
+  mesh.position.y = -h / 2 + 0.04;
+  pivot.add(mesh);
+  return pivot;
+}
+
+function shortestArc(a) {
+  while (a > Math.PI) a -= Math.PI * 2;
+  while (a < -Math.PI) a += Math.PI * 2;
+  return a;
+}
+
+function lerpAngle(from, to, t) {
+  return from + shortestArc(to - from) * Math.min(1, t);
+}
+
+export function createPlayer(scene, city, input, audio) {
+  const group = new THREE.Group();      // origin at the ground
+  const rig = new THREE.Group();        // bobs while walking
+  group.add(rig);
+
+  const SKIN = 0xd9a066;
+  const JACKET = 0x0e7c86;              // teal jacket
+  const JACKET_DARK = 0x0a5a61;
+  const PANTS = 0x2b2f3a;
+  const SHOES = 0x17181c;
+
+  // Legs on hip pivots (hip height 0.92).
+  const legL = limb(0.21, 0.92, 0.24, PANTS, -0.15, 0.92, 0);
+  const legR = limb(0.21, 0.92, 0.24, PANTS, 0.15, 0.92, 0);
+  const shoeL = box(0.22, 0.09, 0.34, SHOES); shoeL.position.set(0, -0.9, 0.05); legL.add(shoeL);
+  const shoeR = box(0.22, 0.09, 0.34, SHOES); shoeR.position.set(0, -0.9, 0.05); legR.add(shoeR);
+  rig.add(legL, legR);
+
+  // Torso: teal jacket with a darker shirt stripe down the front.
+  const torso = box(0.62, 0.68, 0.34, JACKET);
+  torso.position.y = 1.26;
+  rig.add(torso);
+  const shirt = box(0.3, 0.6, 0.02, JACKET_DARK);
+  shirt.position.set(0, 1.26, 0.18);
+  rig.add(shirt);
+  const belt = box(0.63, 0.09, 0.35, 0x1c1c22);
+  belt.position.y = 0.95;
+  rig.add(belt);
+
+  // Arms on shoulder pivots (shoulder height 1.56).
+  const armL = limb(0.16, 0.68, 0.18, JACKET, -0.4, 1.56, 0);
+  const armR = limb(0.16, 0.68, 0.18, JACKET, 0.4, 1.56, 0);
+  const handL = box(0.15, 0.12, 0.16, SKIN); handL.position.set(0, -0.68, 0); armL.add(handL);
+  const handR = box(0.15, 0.12, 0.16, SKIN); handR.position.set(0, -0.68, 0); armR.add(handR);
+  rig.add(armL, armR);
+
+  // Dark pistol gripped in the right hand, barrel pointing forward (+Z
+  // in the character's local space, matching the facing convention).
+  const pistol = new THREE.Group();
+  const grip = box(0.07, 0.16, 0.09, 0x24262b); grip.position.set(0, -0.04, 0.02); pistol.add(grip);
+  const slide = box(0.06, 0.08, 0.3, 0x33363d); slide.position.set(0, 0.05, 0.1); pistol.add(slide);
+  const muzzleTip = new THREE.Object3D(); muzzleTip.position.set(0, 0.05, 0.27); pistol.add(muzzleTip);
+  pistol.position.set(0, -0.72, 0.06);
+  armR.add(pistol);
+
+  // Head with hair cap and sunglasses band.
+  const head = box(0.32, 0.34, 0.3, SKIN);
+  head.position.y = 1.78;
+  rig.add(head);
+  const hair = box(0.34, 0.1, 0.32, 0x201812);
+  hair.position.y = 1.97;
+  rig.add(hair);
+  const shades = box(0.33, 0.07, 0.02, 0x0c0d10);
+  shades.position.set(0, 1.8, 0.16);
+  rig.add(shades);
+
+  scene.add(group);
+
+  let walkPhase = 0;
+  let exhausted = false;
+
+  // Circle (player) vs AABB push-out against every city collider.
+  function pushOutOfColliders() {
+    const pos = group.position;
+    for (const c of city.colliders) {
+      const nx = Math.max(c.x - c.hw, Math.min(pos.x, c.x + c.hw));
+      const nz = Math.max(c.z - c.hd, Math.min(pos.z, c.z + c.hd));
+      let dx = pos.x - nx;
+      let dz = pos.z - nz;
+      const d2 = dx * dx + dz * dz;
+      if (d2 > 1e-8) {
+        if (d2 < PLAYER_RADIUS * PLAYER_RADIUS) {
+          const d = Math.sqrt(d2);
+          pos.x = nx + (dx / d) * PLAYER_RADIUS;
+          pos.z = nz + (dz / d) * PLAYER_RADIUS;
+        }
+      } else {
+        // Centre is inside the box: leave along the shallowest axis.
+        const left = pos.x - (c.x - c.hw);
+        const right = (c.x + c.hw) - pos.x;
+        const back = pos.z - (c.z - c.hd);
+        const front = (c.z + c.hd) - pos.z;
+        const m = Math.min(left, right, back, front);
+        if (m === left) pos.x = c.x - c.hw - PLAYER_RADIUS;
+        else if (m === right) pos.x = c.x + c.hw + PLAYER_RADIUS;
+        else if (m === back) pos.z = c.z - c.hd - PLAYER_RADIUS;
+        else pos.z = c.z + c.hd + PLAYER_RADIUS;
+      }
+    }
+    pos.x = Math.max(-WORLD_BOUND, Math.min(WORLD_BOUND, pos.x));
+    pos.z = Math.max(-WORLD_BOUND, Math.min(WORLD_BOUND, pos.z));
+  }
+
   const player = {
-    mesh,
-    pos: mesh.position,
-    yaw: 0,
+    group,
     health: 100,
-    cash: 0,
-    onFoot: true,
-    vehicle: null,
-    walkPhase: 0,
-    regenTimer: 0,
-    invulnTimer: 0,
+    armor: 0,
+    stamina: STAMINA_MAX,
+    car: null,
+    dead: false,
+    angle: 0,
+    justEntered: null,
+
+    enterCar(car) {
+      if (!car || this.car) return;
+      this.car = car;
+      car.occupied = true;
+      group.visible = false;
+      this.justEntered = car;
+      this.angle = car.angle;
+    },
+
+    exitCar() {
+      const car = this.car;
+      if (!car) return;
+      // Step out beside the car, perpendicular to its facing.
+      const px = Math.cos(car.angle);
+      const pz = -Math.sin(car.angle);
+      group.position.set(car.group.position.x + px * 2.2, 0, car.group.position.z + pz * 2.2);
+      pushOutOfColliders();
+      this.angle = car.angle;
+      group.rotation.y = this.angle;
+      car.occupied = false;
+      this.car = null;
+      group.visible = true;
+      if (audio) audio.engineSet(false, 0);
+    },
+
+    damage(n) {
+      if (this.dead || n <= 0) return;
+      let rest = n;
+      if (this.armor > 0) {
+        const blocked = Math.min(this.armor, n * 0.6);
+        this.armor -= blocked;
+        rest = n - blocked;
+      }
+      this.health -= rest;
+      if (this.health <= 0) {
+        this.health = 0;
+        this.dead = true;
+      }
+    },
+
+    addArmor(n) {
+      this.armor = Math.max(0, Math.min(100, this.armor + n));
+    },
+
+    muzzlePos() {
+      const s = Math.sin(this.angle);
+      const c = Math.cos(this.angle);
+      return new THREE.Vector3(
+        group.position.x + s * 0.5,
+        group.position.y + 1.35,
+        group.position.z + c * 0.5
+      );
+    },
+
+    reset(pos) {
+      if (this.car) {
+        this.car.occupied = false;
+        this.car = null;
+      }
+      this.health = 100;
+      this.stamina = STAMINA_MAX;
+      exhausted = false;
+      this.dead = false;
+      group.visible = true;
+      if (pos) group.position.set(pos.x || 0, pos.y || 0, pos.z || 0);
+      if (audio) audio.engineSet(false, 0);
+    },
+
+    update(dt, ctx) {
+      this.justEntered = null;
+      if (this.dead) return;
+      ctx = ctx || {};
+
+      // ---- Driving -------------------------------------------------
+      if (this.car) {
+        const car = this.car;
+        if (input.pressed('KeyE')) {
+          this.exitCar();
+          return;
+        }
+        let throttle = 0;
+        if (input.isDown('KeyW') || input.isDown('ArrowUp')) throttle = 1;
+        else if (input.isDown('KeyS') || input.isDown('ArrowDown')) throttle = -0.6;
+        let steer = 0;
+        if (input.isDown('KeyA') || input.isDown('ArrowLeft')) steer += 1;   // left
+        if (input.isDown('KeyD') || input.isDown('ArrowRight')) steer -= 1;  // right
+        const handbrake = input.isDown('Space');
+        if (handbrake) throttle = 0;
+        stepCar(car, throttle, steer, dt, city.colliders);
+        if (handbrake) car.speed *= Math.exp(-4.5 * dt);
+        this.angle = car.angle;
+        group.position.copy(car.group.position);
+        if (audio) audio.engineSet(true, car.maxSpeed > 0 ? Math.abs(car.speed) / car.maxSpeed : 0);
+        return;
+      }
+
+      // ---- Enter a nearby car --------------------------------------
+      if (input.pressed('KeyE') && ctx.nearestCar) {
+        const cp = ctx.nearestCar.group.position;
+        const dx = cp.x - group.position.x;
+        const dz = cp.z - group.position.z;
+        if (dx * dx + dz * dz <= ENTER_RANGE * ENTER_RANGE) {
+          this.enterCar(ctx.nearestCar);
+          return;
+        }
+      }
+
+      // ---- On foot --------------------------------------------------
+      const camYaw = ctx.camYaw || 0;
+      const fx = Math.sin(camYaw), fz = Math.cos(camYaw);   // camera forward
+      const rx = -Math.cos(camYaw), rz = Math.sin(camYaw);  // camera right
+      let ix = 0, iz = 0;
+      if (input.isDown('KeyW') || input.isDown('ArrowUp')) { ix += fx; iz += fz; }
+      if (input.isDown('KeyS') || input.isDown('ArrowDown')) { ix -= fx; iz -= fz; }
+      if (input.isDown('KeyD') || input.isDown('ArrowRight')) { ix += rx; iz += rz; }
+      if (input.isDown('KeyA') || input.isDown('ArrowLeft')) { ix -= rx; iz -= rz; }
+      const moving = (ix !== 0 || iz !== 0);
+      if (moving) {
+        const len = Math.hypot(ix, iz);
+        ix /= len; iz /= len;
+      }
+
+      const inWater = city.isWater(group.position.x, group.position.z);
+      const wantSprint = moving &&
+        (input.isDown('ShiftLeft') || input.isDown('ShiftRight')) &&
+        !inWater && !exhausted && this.stamina > 1;
+      const sprinting = wantSprint && this.stamina > 0;
+
+      if (sprinting) {
+        this.stamina = Math.max(0, this.stamina - SPRINT_DRAIN * dt);
+        if (this.stamina <= 0) exhausted = true;
+      } else {
+        this.stamina = Math.min(STAMINA_MAX, this.stamina + STAMINA_REGEN * dt);
+        if (exhausted && this.stamina > SPRINT_UNLOCK) exhausted = false;
+      }
+
+      let speed = sprinting ? SPRINT_SPEED : WALK_SPEED;
+      if (inWater) speed *= 0.45;
+
+      if (moving) {
+        group.position.x += ix * speed * dt;
+        group.position.z += iz * speed * dt;
+        pushOutOfColliders();
+        this.angle = lerpAngle(this.angle, Math.atan2(ix, iz), dt * 12);
+        walkPhase += dt * speed * 1.55;
+      } else {
+        // Idle: turn to face where the camera looks.
+        this.angle = lerpAngle(this.angle, camYaw, dt * 6);
+      }
+      group.rotation.y = this.angle;
+
+      // Walk cycle: legs and the free arm swing opposite each other; the
+      // gun arm stays mostly raised. Limbs ease back to rest when idle.
+      const swing = moving ? Math.sin(walkPhase) * (sprinting ? 0.85 : 0.6) : 0;
+      const ease = moving ? 1 : Math.max(0, 1 - dt * 10);
+      legL.rotation.x = swing * ease;
+      legR.rotation.x = -swing * ease;
+      armL.rotation.x = -swing * 0.8 * ease;
+      armR.rotation.x = -0.35 + swing * 0.25 * ease;
+      rig.position.y = moving ? Math.abs(Math.sin(walkPhase)) * 0.05 : 0;
+    },
   };
-  G.player = player;
+
   return player;
-}
-
-export function updatePlayerOnFoot(G, dt) {
-  const p = G.player;
-  const input = G.input;
-  const sprint = input.down('ShiftLeft') || input.down('ShiftRight');
-  const speed = sprint ? 9.5 : 5.2;
-  let mx = 0, mz = 0;
-  if (input.down('KeyW') || input.down('ArrowUp')) mz += 1;
-  if (input.down('KeyS') || input.down('ArrowDown')) mz -= 1;
-  if (input.down('KeyA') || input.down('ArrowLeft')) mx -= 1;
-  if (input.down('KeyD') || input.down('ArrowRight')) mx += 1;
-  if (G.demoAuto && G.demo !== 2) { mz = 1; mx = 0; }
-
-  const moving = mx !== 0 || mz !== 0;
-  if (moving) {
-    const len = Math.hypot(mx, mz);
-    mx /= len; mz /= len;
-    // Camera-relative movement.
-    const cy = G.camYaw;
-    const fx = Math.sin(cy), fz = Math.cos(cy);
-    const rx = Math.cos(cy), rz = -Math.sin(cy);
-    const wx = fx * mz + rx * mx;
-    const wz = fz * mz + rz * mx;
-    let nx = p.pos.x + wx * speed * dt;
-    let nz = p.pos.z + wz * speed * dt;
-    const fixed = collideBuildings(G, nx, nz, 0.6);
-    nx = fixed.x; nz = fixed.z;
-    const clamped = clampToCity(G, nx, nz, 3);
-    p.pos.x = clamped.x; p.pos.z = clamped.z;
-    p.yaw = Math.atan2(wx, wz);
-    p.mesh.rotation.y = p.yaw;
-    // Walk cycle.
-    p.walkPhase += dt * (sprint ? 13 : 9);
-    const s = Math.sin(p.walkPhase);
-    p.mesh.userData.legL.position.z = s * 0.22;
-    p.mesh.userData.legR.position.z = -s * 0.22;
-    p.mesh.userData.armL.position.z = -s * 0.18;
-    p.mesh.userData.armR.position.z = s * 0.18;
-    p.mesh.position.y = Math.abs(Math.sin(p.walkPhase)) * 0.05;
-  } else {
-    p.mesh.userData.legL.position.z = 0;
-    p.mesh.userData.legR.position.z = 0;
-    p.mesh.userData.armL.position.z = 0;
-    p.mesh.userData.armR.position.z = 0;
-    p.mesh.position.y = 0;
-  }
-
-  // Slow health regen when calm.
-  p.regenTimer += dt;
-  if (G.wantedSystem.level === 0 && p.health < 100 && p.regenTimer > 1) {
-    p.health = Math.min(100, p.health + 2);
-    p.regenTimer = 0;
-  }
-  if (p.invulnTimer > 0) p.invulnTimer -= dt;
-}
-
-export function tryEnterExitCar(G) {
-  const p = G.player;
-  if (p.onFoot) {
-    const car = nearestCar(G, p.pos.x, p.pos.z, 4.2);
-    if (!car) return;
-    // Any car can be stolen, police cars included (their pursuit AI is
-    // switched off on entry and police.js skips the player's own car).
-    p.vehicle = car;
-    p.onFoot = false;
-    car.ai = null;
-    car.parked = false;
-    if (car.hasDriver) {
-      car.hasDriver = false;
-      // The driver flees on foot.
-      G.events.push({ type: 'driverFled', x: car.mesh.position.x, z: car.mesh.position.z });
-      G.audio.sirenBlip();
-    }
-    // Stealing any car you don't own draws heat (once per car).
-    if (!car.stolen) {
-      car.stolen = true;
-      if (G.wantedSystem.level < 2) G.wantedSystem.add(1, 'car theft');
-      G.ui.toast('Car stolen! +1 wanted star');
-    }
-    p.mesh.visible = false;
-    G.ui.toast(car.marked ? 'Marked car secured — deliver it!' : 'You are driving');
-  } else {
-    const car = p.vehicle;
-    if (!car) return;
-    // Step out on the car's left side; never spawn inside a building.
-    const fx = Math.sin(car.yaw + Math.PI / 2), fz = Math.cos(car.yaw + Math.PI / 2);
-    let ex = car.mesh.position.x + fx * 2.4;
-    let ez = car.mesh.position.z + fz * 2.4;
-    const fixed = collideBuildings(G, ex, ez, 0.6);
-    ex = fixed.x; ez = fixed.z;
-    const clamped = clampToCity(G, ex, ez, 3);
-    p.pos.x = clamped.x;
-    p.pos.z = clamped.z;
-    p.pos.y = 0;
-    p.mesh.visible = true;
-    p.onFoot = true;
-    p.vehicle = null;
-    car.speed = 0;
-    car.parked = true;
-  }
-}
-
-export function damagePlayer(G, amount, cause) {
-  const p = G.player;
-  if (p.invulnTimer > 0 || G.state !== 'playing') return;
-  p.health -= amount;
-  p.invulnTimer = 0.4;
-  if (p.health <= 0) {
-    p.health = 0;
-    G.events.push({ type: 'playerDown', cause });
-  }
 }

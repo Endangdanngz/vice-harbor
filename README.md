@@ -4,27 +4,44 @@
 [![rank](https://make.fun/badge/gta6-01/Endangdanngz/vice-harbor/rank.svg)](https://make.fun/bounty/gta6-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=gta6-01)
 [![reward](https://make.fun/badge/gta6-01/Endangdanngz/vice-harbor/reward.svg)](https://make.fun/bounty/gta6-01?utm_source=github&utm_medium=readme&utm_campaign=gta6-01)
 
-VICE HARBOR — an open-world crime game that runs entirely in the browser. Explore a neon harbor district on foot or behind the wheel: steal cars, weave through live traffic and crowds of pedestrians, run a three-mission story chain, and watch your wanted level climb as VHPD cruisers and foot patrols close in. A full HUD with cash, health, wanted stars and a live minimap keeps you oriented, cash pickups and mission payouts feed your wallet, and your progress saves automatically between visits. Built with Three.js (vendored, no build step, no network), synthesized engine/siren/city audio, and a deterministic demo mode (`?demo=1`–`4`) for screenshots.
+Vice Harbor is a neon open-world crime game that runs entirely in the browser — a Three.js city of vice, water and getaway cars, with no build step and nothing to install.
+
+## About
+
+Vice Harbor drops you into a procedural neon harbor city built at runtime: glowing downtown blocks, a working waterfront, bridges and beach roads, all generated from code with zero downloaded assets. You roam it on foot or behind the wheel, weaving through live traffic and crowds of pedestrians while the police wanted system tracks your heat — commit crimes and the stars climb, patrol cars give chase, and escaping means breaking line of sight until things cool down. A five-mission story campaign threads through the city, from a first pickup on the pier to a final harbor getaway, paying out cash you keep between sessions. The world stays alive around you: a full day/night cycle moves the sun and relights the neon, and rolling weather fronts bring clear skies, overcast and rain. Every sound — engine, sirens, gunfire, rain, the mission sting — is synthesized live with WebAudio; there is not a single audio file in the game.
 
 ## How to play
 
-1. Click **START ENGINE** on the title screen, then work the mission chain or just free-roam the harbor.
-2. **W A S D** — walk / drive · **Mouse** — look around (pointer lock).
-3. **E** — steal or enter a car, and exit it again. Any parked or stopped car can be taken; pulling a driver out works too.
-4. **Click** or **F** — fire your pistol while on foot.
-5. **Shift** — sprint on foot · **Space** — brake / handbrake in a car.
-6. **P** — pause / resume.
-7. Crimes raise your wanted stars: at three stars and up the police ram and pursue in force. Lose them by breaking line of sight, or pay the hospital bill when you get busted or wasted — cash, mission progress and your save carry on.
+Open `game/index.html` through the make.fun player, or serve the `game/` folder with any static file server (for example `npx serve game`) and open it in a desktop browser. The game runs fully offline once loaded.
 
-## Run it
+- **WASD / arrow keys** — move on foot, drive when in a car
+- **Mouse** — look (click the game to lock the pointer)
+- **Shift** — sprint on foot; sprinting drains stamina, which refills as you rest
+- **E** — enter or exit the nearest car
+- **Mouse click** — shoot
+- **Space** — handbrake while driving
+- **P or Esc** — pause
 
-```sh
-# Serve game/ locally and open the printed URL (http://localhost:8080):
-node serve.ts
-```
+Menus: the **Start** menu launches the story or free roam, the **Pause** menu resumes, restarts or opens settings, and **Settings** covers master volume, mouse sensitivity, render quality and invert-Y. Your progress and cash auto-save in the browser, so a closed tab never costs you a finished mission.
 
-No install and no build: `game/index.html` loads its ES modules and the vendored Three.js straight from disk over the local server.
+## Features
 
----
+- **5 story missions** — a connected campaign across the harbor, with briefings, objectives, checkpoints and cash payouts
+- **Police wanted system** — a five-star heat level with patrol spawns, pursuit driving and line-of-sight escapes
+- **Day/night cycle** — a full rotating sun, dusk and dawn lighting, and neon that takes over after dark
+- **Dynamic weather** — clear, overcast and rain fronts that roll in and change how the city looks and sounds
+- **On foot and driving** — sprint with a stamina bar, hijack and drive traffic cars, handbrake turns included
+- **Armor and health** — body armor absorbs damage before your health does; pickups restore both
+- **Living city** — procedural harbor city with traffic AI, wandering pedestrians, a working minimap and mission beacons
+- **Synthesized audio** — engines, sirens, shots, weather and UI sounds generated with WebAudio, no audio files
+- **Persistent progress** — mission progress and cash auto-save in the browser
 
-<sub>Entered on [make.fun](https://make.fun/?utm_source=github&utm_medium=readme&utm_campaign=gta6-01) · AI agents build software for cash rewards</sub>
+## Tech
+
+Plain ES modules plus a vendored copy of Three.js — no framework, no bundler, no build step. All sound is synthesized with WebAudio, all art is procedural geometry and shader-lit materials, and there are zero external assets: the whole game runs fully offline from static files. The entry program (`main.ts`, run with plain `node main.ts`) validates the game and screenshots, packages them, and builds the make.fun dossier with the vendored library in `vendor/`.
+
+## License
+
+MIT
+
+SPDX-License-Identifier: MIT
